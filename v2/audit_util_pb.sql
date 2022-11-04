@@ -249,7 +249,6 @@ begin
     return g_aud_prefix||substr(upper(substr(p_table_name,1,120-nvl(length(g_aud_prefix),0)))||'_'||upper(p_owner),1,120);
   end if;
 end;
-
 --
 -- single point for standard audit table name (typically "PKG_"<table>)
 --
@@ -287,6 +286,15 @@ function audit_trigger_name(p_table_name varchar2, p_owner varchar2) return varc
 begin
     return 'AUD$'||upper(substr(p_table_name,1,90))||'_'||upper(p_owner);
 end;
+
+--
+-- single point for standard audit table name (typically "PKG_"<table>"_HIS")
+--
+function history_package_name(p_table_name varchar2, p_owner varchar2) return varchar2 is
+begin
+  return audit_package_name(p_table_name, p_owner) || '_HIS';
+end;
+
 
 --
 -- Return a shortened name for the table for use
@@ -367,28 +375,9 @@ PROCEDURE grant_audit_access(p_object_name varchar2
   l_object_name varchar2(200) := regexp_replace(upper(p_object_name),'^'||g_aud_schema||'\.');
 BEGIN
   --
-  -- just package asked for
+  -- just for history package
   --
-  if l_object_name like 'PKG%' then
-    grant_package_access(l_object_name,p_owner,upper(p_action)='EXECUTE');
-  elsif (g_aud_prefix is null or substr(l_object_name,1,length(g_aud_prefix)) = g_aud_prefix ) then
-    --
-    -- otherwise the whole lot for tables eg AUD_MY_TABLE...
-    --
-    grant_table_access(l_object_name,p_owner,upper(p_action)='EXECUTE');
-    grant_package_access(
-       audit_package_name(
-           case when g_aud_prefix is not null then regexp_replace(l_object_name,'^'||g_aud_prefix) else l_object_name end
-           ,p_owner),
-         p_owner,
-         upper(p_action)='EXECUTE');
-  else
-    --
-    -- maybe they left off the AUD_ prefix
-    --
-    grant_table_access(audit_table_name(l_object_name,p_owner),p_owner,upper(p_action)='EXECUTE');
-    grant_package_access(audit_package_name(l_object_name,p_owner),p_owner,upper(p_action)='EXECUTE');
-  end if;
+  grant_package_access(history_package_name(l_object_name,p_owner),upper(p_action)='EXECUTE');
 END;
 
 
@@ -436,7 +425,6 @@ begin
            ' pctfree 1 tablespace '||g_aud_tspace, p_execute);
 
     p_created := true;
-    grant_table_access(l_audit_table_name,p_owner,p_execute);
   exception
     when no_data_found then
       p_created := false;
@@ -708,13 +696,13 @@ BEGIN
                       ,p_action);
 END;
 
+--
+-- generate history package (generated package is called exclusively from within audit triggers)
+--
+PROCEDURE generate_history_package(p_owner varchar2
+                                  ,p_table_name varchar2
+                                  ,p_action varchar2) is
 
---
--- generate audit row package (generated package is called exclusively from within audit triggers)
---
-PROCEDURE generate_audit_package(p_owner varchar2
-                                ,p_table_name varchar2
-                                ,p_action varchar2) is
   cursor col_defn is
     select column_name,
            data_type,
@@ -725,7 +713,7 @@ PROCEDURE generate_audit_package(p_owner varchar2
     order  by column_id;
 
   type col_list is table of col_defn%rowtype;
-  cols col_list;
+  cols col_list;                                  
 
   l_ddl   clob;
 
@@ -735,7 +723,7 @@ PROCEDURE generate_audit_package(p_owner varchar2
   end;
 
 BEGIN
-  logger('Call to generate audit package for '||p_owner||'.'||p_table_name);
+  logger('Call to generate history package for '||p_owner||'.'||p_table_name);
 
   -- just in case someone called us directly
   init(p_table_name=>audit_table_name(p_table_name,p_owner));
@@ -750,7 +738,7 @@ BEGIN
   close col_defn;
 
   bld('create or replace');
-  bld('package '||g_aud_schema||'.'||audit_package_name(p_table_name,p_owner)||' is');
+  bld('package '||g_aud_schema||'.'||history_package_name(p_table_name,p_owner)||' is');
 
   bld(' ');
   bld(' /***************************************************************/');
@@ -761,31 +749,6 @@ BEGIN
   bld(' /* will be lost if the package are re-generated.               */');
   bld(' /***************************************************************/');
 
-  if g_bulk_bind then
-    bld(' ');
-    bld('  procedure bulk_init;');
-    bld('  procedure bulk_process;');
-  end if;
-
-  bld(' ');
-  bld('  procedure audit_row(');
-  bld('     p_aud$tstamp                     timestamp');
-  bld('    ,p_aud$id                         number');
-  bld('    ,p_aud$image                      varchar2');
-
-  for i in 1 .. cols.count loop
-     -- intervals are different...
-     if (cols(i).data_type like 'INTERVAL DAY%') then
-        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||'dsinterval_unconstrained');
-     elsif (cols(i).data_type like 'INTERVAL YEAR%') then
-        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||'yminterval_unconstrained');
-     else
-        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||lower(regexp_replace(cols(i).data_type,'\(.*\)')));
-     end if;
-  end loop;
-  bld('  );');
-
-  bld(' ');
   bld('  function show_history(');
   bld('     p_aud$tstamp_from  timestamp default localtimestamp - numtodsinterval(7,''DAY'')');
   bld('    ,p_aud$tstamp_to    timestamp default localtimestamp');
@@ -813,13 +776,16 @@ BEGIN
   end loop;
 
   bld('  ) return clob;');
-  bld('end;');
+
+  bld(' ');
+  bld('end;');  
+
   do_sql(l_ddl,upper(p_action)='EXECUTE');
 
-  l_ddl := null;
+  l_ddl := null;  
 
   bld('create or replace');
-  bld('package body '||g_aud_schema||'.'||audit_package_name(p_table_name,p_owner)||' is');
+  bld('package body '||g_aud_schema||'.'||history_package_name(p_table_name,p_owner)||' is');
   bld(' ');
   bld(' /***************************************************************/');
   bld(' /* ATTENTION                                                   */');
@@ -828,91 +794,7 @@ BEGIN
   bld(' /* utility.  Do not edit this package by hand as your changes  */');
   bld(' /* will be lost if the package are re-generated.               */');
   bld(' /***************************************************************/');
-  bld(' ');
-
-  if g_bulk_bind then
-    bld('    type t_audit_rows is table of '||g_aud_schema||'.'||audit_table_name(p_table_name,p_owner)||'%rowtype');
-    bld('      index by pls_integer;');
-    bld(' ');
-    bld('    l_audrows t_audit_rows;');
-    bld(' ');
-    bld('  procedure bulk_init is');
-    bld('  begin');
-    bld('    l_audrows.delete;');
-    bld('  end;');
-    bld(' ');
-    bld('  procedure bulk_process is');
-    bld('  begin');
-    bld('    forall i in 1 .. l_audrows.count');
-    bld('      insert into '||g_aud_schema||'.'||audit_table_name(p_table_name,p_owner)||' values l_audrows(i);');
-    bld('    bulk_init;');
-    bld('  end;');
-    bld(' ');
-  end if;
-
-  bld('  procedure audit_row(');
-  bld('     p_aud$tstamp                    timestamp');
-  bld('    ,p_aud$id                        number');
-  bld('    ,p_aud$image                     varchar2');
-
-  for i in 1 .. cols.count loop
-     -- intervals are different...
-     if (cols(i).data_type like 'INTERVAL DAY%') then
-        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||'dsinterval_unconstrained');
-     elsif (cols(i).data_type like 'INTERVAL YEAR%') then
-        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||'yminterval_unconstrained');
-     else
-        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||lower(regexp_replace(cols(i).data_type,'\(.*\)')));
-     end if;
-  end loop;
-
-  bld('  ) is');
-
-  if g_bulk_bind then
-    bld('    l_idx pls_integer := l_audrows.count+1;');
-  end if;
-
-  bld('  begin');
-  bld('');
-
-  if g_bulk_bind then
-
-    bld('    if l_idx > '||g_bulk_bind_limit||' then');
-    bld('      bulk_process;');
-    bld('      l_idx := 1;');
-    bld('    end if;');
-    bld(' ');
-    bld('    l_audrows(l_idx).aud$tstamp   := p_aud$tstamp;');
-    bld('    l_audrows(l_idx).aud$id       := p_aud$id;');
-    bld('    l_audrows(l_idx).aud$image    := p_aud$image;');
-
-    for i in 1 .. cols.count loop
-      bld('    l_audrows(l_idx).'||rpad(quote_special_col(lower(cols(i).column_name)),cols(i).maxlen+4)||' := p_'||lower(cols(i).column_name)||';');
-    end loop;
-
-  else
-    bld('  insert into '||g_aud_schema||'.'||audit_table_name(p_table_name,p_owner)||' (');
-    bld('     aud$tstamp');
-    bld('    ,aud$id');
-    bld('    ,aud$image');
-
-    for i in 1 .. cols.count loop
-      bld('    ,'||lower(cols(i).column_name));
-    end loop;
-
-    bld('  ) values (');
-    bld('     p_aud$tstamp');
-    bld('    ,p_aud$id');
-    bld('    ,p_aud$image');
-
-    for i in 1 .. cols.count loop
-      bld('    ,p_'||substr(lower(cols(i).column_name),1,110));
-    end loop;
-
-    bld('    );');
-  end if;
-  bld('  end;');
-  bld('');
+  bld(' ');  
 
   bld('  function show_history(');
   bld('     p_aud$tstamp_from  timestamp default localtimestamp - numtodsinterval(7,''DAY'')');
@@ -1083,14 +965,197 @@ BEGIN
   bld(q'~    l_output := l_output || ']}';~');
   bld('   return l_output;');
   bld('  end;');
-
   
   bld('');
+  bld('end;');  
+
+  do_sql(l_ddl,upper(p_action)='EXECUTE');
+
+  grant_audit_access(p_owner, p_table_name, upper(p_action)='EXECUTE');
+
+END;
+
+--
+-- generate audit row package (generated package is called exclusively from within audit triggers)
+--
+PROCEDURE generate_audit_package(p_owner varchar2
+                                ,p_table_name varchar2
+                                ,p_action varchar2) is
+  cursor col_defn is
+    select column_name,
+           data_type,
+           max(length(column_name)) over () as maxlen
+    from   dba_tab_columns
+    where  owner = p_owner
+    and    table_name = p_table_name
+    order  by column_id;
+
+  type col_list is table of col_defn%rowtype;
+  cols col_list;
+
+  l_ddl   clob;
+
+  procedure bld(p_sql varchar2) is
+  begin
+     l_ddl := l_ddl || p_sql || chr(10);
+  end;
+
+BEGIN
+  logger('Call to generate audit package for '||p_owner||'.'||p_table_name);
+
+  -- just in case someone called us directly
+  init(p_table_name=>audit_table_name(p_table_name,p_owner));
+
+  if not valid_schema(p_owner) then
+    die('You can only manage audit facilities for schemas listed in SCHEMA_LIST');
+  end if;
+
+  open col_defn;
+  fetch col_defn
+  bulk collect into cols;
+  close col_defn;
+
+  bld('create or replace');
+  bld('package '||g_aud_schema||'.'||audit_package_name(p_table_name,p_owner)||' is');
+
+  bld(' ');
+  bld(' /***************************************************************/');
+  bld(' /* ATTENTION                                                   */');
+  bld(' /*                                                             */');
+  bld(' /* This package is automatically generated by audit generator  */');
+  bld(' /* utility.  Do not edit this package by hand as your changes  */');
+  bld(' /* will be lost if the package are re-generated.               */');
+  bld(' /***************************************************************/');
+
+  if g_bulk_bind then
+    bld(' ');
+    bld('  procedure bulk_init;');
+    bld('  procedure bulk_process;');
+  end if;
+
+  bld(' ');
+  bld('  procedure audit_row(');
+  bld('     p_aud$tstamp                     timestamp');
+  bld('    ,p_aud$id                         number');
+  bld('    ,p_aud$image                      varchar2');
+
+  for i in 1 .. cols.count loop
+     -- intervals are different...
+     if (cols(i).data_type like 'INTERVAL DAY%') then
+        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||'dsinterval_unconstrained');
+     elsif (cols(i).data_type like 'INTERVAL YEAR%') then
+        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||'yminterval_unconstrained');
+     else
+        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||lower(regexp_replace(cols(i).data_type,'\(.*\)')));
+     end if;
+  end loop;
+  bld('  );');
+
+  bld(' ');
   bld('end;');
   do_sql(l_ddl,upper(p_action)='EXECUTE');
 
-  grant_package_access(audit_package_name(p_table_name,p_owner),p_owner,upper(p_action)='EXECUTE');
+  l_ddl := null;
 
+  bld('create or replace');
+  bld('package body '||g_aud_schema||'.'||audit_package_name(p_table_name,p_owner)||' is');
+  bld(' ');
+  bld(' /***************************************************************/');
+  bld(' /* ATTENTION                                                   */');
+  bld(' /*                                                             */');
+  bld(' /* This package is automatically generated by audit generator  */');
+  bld(' /* utility.  Do not edit this package by hand as your changes  */');
+  bld(' /* will be lost if the package are re-generated.               */');
+  bld(' /***************************************************************/');
+  bld(' ');
+
+  if g_bulk_bind then
+    bld('    type t_audit_rows is table of '||g_aud_schema||'.'||audit_table_name(p_table_name,p_owner)||'%rowtype');
+    bld('      index by pls_integer;');
+    bld(' ');
+    bld('    l_audrows t_audit_rows;');
+    bld(' ');
+    bld('  procedure bulk_init is');
+    bld('  begin');
+    bld('    l_audrows.delete;');
+    bld('  end;');
+    bld(' ');
+    bld('  procedure bulk_process is');
+    bld('  begin');
+    bld('    forall i in 1 .. l_audrows.count');
+    bld('      insert into '||g_aud_schema||'.'||audit_table_name(p_table_name,p_owner)||' values l_audrows(i);');
+    bld('    bulk_init;');
+    bld('  end;');
+    bld(' ');
+  end if;
+
+  bld('  procedure audit_row(');
+  bld('     p_aud$tstamp                    timestamp');
+  bld('    ,p_aud$id                        number');
+  bld('    ,p_aud$image                     varchar2');
+
+  for i in 1 .. cols.count loop
+     -- intervals are different...
+     if (cols(i).data_type like 'INTERVAL DAY%') then
+        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||'dsinterval_unconstrained');
+     elsif (cols(i).data_type like 'INTERVAL YEAR%') then
+        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||'yminterval_unconstrained');
+     else
+        bld('    ,p_'||rpad(substr(lower(cols(i).column_name),1,110),cols(i).maxlen+2)||''||lower(regexp_replace(cols(i).data_type,'\(.*\)')));
+     end if;
+  end loop;
+
+  bld('  ) is');
+
+  if g_bulk_bind then
+    bld('    l_idx pls_integer := l_audrows.count+1;');
+  end if;
+
+  bld('  begin');
+  bld('');
+
+  if g_bulk_bind then
+
+    bld('    if l_idx > '||g_bulk_bind_limit||' then');
+    bld('      bulk_process;');
+    bld('      l_idx := 1;');
+    bld('    end if;');
+    bld(' ');
+    bld('    l_audrows(l_idx).aud$tstamp   := p_aud$tstamp;');
+    bld('    l_audrows(l_idx).aud$id       := p_aud$id;');
+    bld('    l_audrows(l_idx).aud$image    := p_aud$image;');
+
+    for i in 1 .. cols.count loop
+      bld('    l_audrows(l_idx).'||rpad(quote_special_col(lower(cols(i).column_name)),cols(i).maxlen+4)||' := p_'||lower(cols(i).column_name)||';');
+    end loop;
+
+  else
+    bld('  insert into '||g_aud_schema||'.'||audit_table_name(p_table_name,p_owner)||' (');
+    bld('     aud$tstamp');
+    bld('    ,aud$id');
+    bld('    ,aud$image');
+
+    for i in 1 .. cols.count loop
+      bld('    ,'||lower(cols(i).column_name));
+    end loop;
+
+    bld('  ) values (');
+    bld('     p_aud$tstamp');
+    bld('    ,p_aud$id');
+    bld('    ,p_aud$image');
+
+    for i in 1 .. cols.count loop
+      bld('    ,p_'||substr(lower(cols(i).column_name),1,110));
+    end loop;
+
+    bld('    );');
+  end if;
+  bld('  end;');
+  bld('');
+
+  do_sql(l_ddl,upper(p_action)='EXECUTE');
+
+  grant_package_access(audit_package_name(p_table_name,p_owner),p_owner,upper(p_action)='EXECUTE');
 END;
 
 --
@@ -1523,6 +1588,7 @@ BEGIN
   if l_created or l_altered or p_force then
     generate_audit_package(p_owner,p_table_name,p_action);
     generate_audit_trigger(p_owner,p_table_name,p_action,p_update_cols,p_when_clause,p_enable_trigger);
+    generate_history_package(p_owner,p_table_name,p_action);
   end if;
 END;
 
